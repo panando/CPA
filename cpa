@@ -13,8 +13,15 @@
 # 可选环境变量:
 #   CPA_BIN      二进制路径（默认自动探测）
 #   CPA_CONFIG   配置文件路径（默认自动探测）
+#   CPA_ENV      .env 文件路径（默认自动探测，与配置文件同目录优先）
 #   CPA_LOG      日志文件路径（默认 ~/Library/Logs/cliproxyapi.log）
 #   CPA_PIDFILE  PID 文件路径（默认 ${TMPDIR:-/tmp}/cpa.pid）
+#
+# .env 支持:
+#   若存在 .env，启动前会自动 source（变量导出到当前环境）。
+#   若 config.yaml 中包含 ${VAR_NAME} 占位符，脚本会生成一份临时配置文件
+#   /tmp/cpa-config.*.yaml 供给 CPA 使用；停止时自动清理。
+#   真实 API Key 不会写回原始 config.yaml。
 
 set -u
 
@@ -59,6 +66,67 @@ detect_config() {
   return 1
 }
 
+# 探测 .env 文件：与 config.yaml 始终同目录，故只查 config 所在目录（可被 CPA_ENV 显式覆盖）
+detect_env() {
+  if [ -n "${CPA_ENV:-}" ]; then
+    printf '%s\n' "$CPA_ENV"; return 0
+  fi
+  local config_dir
+  config_dir="$(dirname "$1" 2>/dev/null)"
+  if [ -f "$config_dir/.env" ]; then
+    printf '%s\n' "$config_dir/.env"; return 0
+  fi
+  return 1
+}
+
+# 加载 .env，自动导出变量
+load_env() {
+  local envfile="$1"
+  set -a
+  # shellcheck source=/dev/null
+  . "$envfile"
+  set +a
+}
+
+# 判断配置是否包含 ${VAR} 占位符
+needs_render() {
+  python3 - "$1" <<'PY'
+import sys, re
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    text = f.read()
+sys.exit(0 if re.search(r'\$\{[A-Za-z_][A-Za-z0-9_]*\}', text) else 1)
+PY
+}
+
+# 渲染占位符为临时配置文件，返回临时文件路径
+render_config() {
+  local template="$1"
+  local tmpfile
+  # macOS mktemp 要求 X 在文件名末尾，因此先不加后缀，生成后再重命名
+  tmpfile="$(mktemp "${TMPDIR:-/tmp}/cpa-config.XXXXXX")"
+  mv "$tmpfile" "$tmpfile.yaml"
+  tmpfile="$tmpfile.yaml"
+  python3 - "$template" "$tmpfile" <<'PY'
+import sys, re, os
+
+template_path, out_path = sys.argv[1], sys.argv[2]
+
+def repl(match):
+    name = match.group(1)
+    return os.environ.get(name, match.group(0))
+
+with open(template_path, "r", encoding="utf-8") as f:
+    text = f.read()
+
+# 只替换 ${VAR} 形式；未定义的变量保留原样
+rendered = re.sub(r'\$\{([A-Za-z_][A-Za-z0-9_]*)\}', repl, text)
+
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write(rendered)
+PY
+  printf '%s\n' "$tmpfile"
+}
+
 # 读取端口 + 管理密码状态（只输出非敏感信息，绝不输出密码值）
 read_port_key() {
   python3 - "$1" <<'PY'
@@ -89,7 +157,7 @@ for line in text.splitlines():
         elif v.startswith(("$2a$", "$2b$", "$2y$")):
             key_status = "已设置（bcrypt 哈希，原明文无法找回）"
         else:
-            key_status = "已设置（明文）"
+            key_status = "已设置（明文或环境变量引用）"
 print(port or "8317")
 print(key_status)
 PY
@@ -114,6 +182,23 @@ print_info() {
   echo ""
 }
 
+# 打印 .env 相关状态：已找到则显示路径；未找到则提示如何改用环境变量（不阻断默认启动）
+print_env_hint() {
+  local config="$1"
+  local config_dir envfile
+  config_dir="$(dirname "$config" 2>/dev/null)"
+  envfile="$(detect_env "$config" 2>/dev/null)"
+  if [ -n "${envfile:-}" ]; then
+    echo "  .env           : ${envfile}（已找到，API Key 将按环境变量加载）"
+  else
+    echo "  .env           : 未找到（当前按 config.yaml 原样加载，API Key 为明文）"
+    echo "                  提示：为避免明文，可把 API Key 写成 \${VAR_NAME} 占位符，"
+    echo "                  并将真实值写入 $config_dir/.env（与 config.yaml 同目录）"
+    echo "                  例如 .env 内容: CPA_CLAUDE_API_KEY=sk-xxxx"
+  fi
+  echo ""
+}
+
 is_running() {
   [ -f "$PIDFILE" ] || return 1
   local pid
@@ -122,9 +207,19 @@ is_running() {
 }
 
 cmd_on() {
-  local bin config
+  local bin config envfile effective_config
   bin="$(detect_bin)" || { echo "✗ 未找到 cli-proxy-api，请先安装：brew install cliproxyapi" >&2; exit 1; }
   config="$(detect_config)" || { echo "✗ 未找到配置文件（默认 ~/.cli-proxy-api/config.yaml）" >&2; exit 1; }
+
+  # 如果存在 .env，先加载环境变量；未找到则提示（但仍按默认方式启动）
+  envfile="$(detect_env "$config" 2>/dev/null)"
+  if [ -n "${envfile:-}" ]; then
+    load_env "$envfile"
+    echo "✔ 已加载环境变量: $envfile"
+  else
+    echo "ℹ 未找到 .env 文件（默认读取 config.yaml 原样启动）"
+    print_env_hint "$config"
+  fi
 
   if is_running; then
     echo "✔ cli-proxy-api 已在运行 (PID $(cat "$PIDFILE"))"
@@ -132,8 +227,16 @@ cmd_on() {
     return 0
   fi
 
+  # 若配置含占位符，生成临时渲染文件；否则直接用原配置
+  if needs_render "$config"; then
+    effective_config="$(render_config "$config")"
+    echo "✔ 已生成临时渲染配置: $effective_config"
+  else
+    effective_config="$config"
+  fi
+
   mkdir -p "$(dirname "$LOG")"
-  nohup "$bin" -config "$config" >>"$LOG" 2>&1 &
+  nohup "$bin" -config "$effective_config" >>"$LOG" 2>&1 &
   local pid=$!
   echo "$pid" > "$PIDFILE"
   sleep 1.5
@@ -144,6 +247,8 @@ cmd_on() {
     echo "✗ 启动失败，日志见: $LOG" >&2
     tail -5 "$LOG" 2>/dev/null >&2
     rm -f "$PIDFILE"
+    # 失败时也清理可能遗留的临时配置
+    rm -f "${TMPDIR:-/tmp}"/cpa-config.*.yaml
     exit 1
   fi
   print_info "$bin" "$config"
@@ -167,6 +272,8 @@ cmd_off() {
   # 兜底：清理按名字匹配的残留进程（大小写不匹配，不会误杀本脚本）
   pkill -f 'cli-proxy-api' 2>/dev/null
   pkill -f 'cliproxyapi' 2>/dev/null
+  # 清理 envsubst 产生的临时配置文件
+  rm -f "${TMPDIR:-/tmp}"/cpa-config.*.yaml
   echo "✔ cli-proxy-api 已停止"
 }
 
@@ -181,6 +288,7 @@ cmd_status() {
   config="$(detect_config 2>/dev/null)"
   if [ -n "$bin" ] && [ -n "$config" ]; then
     print_info "$bin" "$config"
+    print_env_hint "$config"
   fi
 }
 
@@ -190,6 +298,7 @@ cmd_info() {
   config="$(detect_config)" || config="(未找到)"
   if [ -f "$config" ]; then
     print_info "$bin" "$config"
+    print_env_hint "$config"
   else
     echo "  二进制   : $bin"
     echo "  配置文件 : $config"
@@ -216,7 +325,7 @@ usage() {
   log       实时查看日志（Ctrl+C 退出）
   help      显示本帮助
 
-环境变量: CPA_BIN / CPA_CONFIG / CPA_LOG / CPA_PIDFILE
+环境变量: CPA_BIN / CPA_CONFIG / CPA_ENV / CPA_LOG / CPA_PIDFILE
 EOF
 }
 
