@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+#
+# cpa — CLIProxyAPI 启停包装脚本（nohup 后台方式）
+#
+# 用法:
+#   cpa on       启动 cli-proxy-api 后台运行，并打印关键信息
+#   cpa off      停止 cli-proxy-api
+#   cpa status   查看运行状态
+#   cpa info     只打印关键信息，不启停
+#   cpa log      实时查看日志 (tail -F)
+#   cpa help     帮助
+#
+# 可选环境变量:
+#   CPA_BIN      二进制路径（默认自动探测）
+#   CPA_CONFIG   配置文件路径（默认自动探测）
+#   CPA_LOG      日志文件路径（默认 ~/Library/Logs/cliproxyapi.log）
+#   CPA_PIDFILE  PID 文件路径（默认 ${TMPDIR:-/tmp}/cpa.pid）
+
+set -u
+
+LOG="${CPA_LOG:-$HOME/Library/Logs/cliproxyapi.log}"
+PIDFILE="${CPA_PIDFILE:-${TMPDIR:-/tmp}/cpa.pid}"
+
+# ---------- 路径探测 ----------
+detect_bin() {
+  if [ -n "${CPA_BIN:-}" ]; then
+    printf '%s\n' "$CPA_BIN"; return 0
+  fi
+  local c p
+  for c in cli-proxy-api cliproxyapi; do
+    p="$(command -v "$c" 2>/dev/null)"
+    if [ -n "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  done
+  local p
+  for p in /opt/homebrew/opt/cliproxyapi/bin/cliproxyapi \
+           /usr/local/opt/cliproxyapi/bin/cliproxyapi \
+           /opt/homebrew/bin/cliproxyapi \
+           /usr/local/bin/cliproxyapi; do
+    if [ -x "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  done
+  return 1
+}
+
+detect_config() {
+  if [ -n "${CPA_CONFIG:-}" ]; then
+    printf '%s\n' "$CPA_CONFIG"; return 0
+  fi
+  local p bdir
+  # 优先：二进制同目录下的 config.yaml（standalone 安装最常见）
+  bdir="$(dirname "$(detect_bin 2>/dev/null)" 2>/dev/null)"
+  if [ -n "$bdir" ] && [ -f "$bdir/config.yaml" ]; then
+    printf '%s\n' "$bdir/config.yaml"; return 0
+  fi
+  for p in "$HOME/.cli-proxy-api/config.yaml" \
+           /opt/homebrew/etc/cliproxyapi.conf \
+           /usr/local/etc/cliproxyapi.conf; do
+    if [ -f "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  done
+  return 1
+}
+
+# 读取端口 + 管理密码状态（只输出非敏感信息，绝不输出密码值）
+read_port_key() {
+  python3 - "$1" <<'PY'
+import sys, re
+try:
+    text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+except Exception:
+    text = ""
+port = None
+key_status = "未配置（配置文件中没有该字段）"
+for line in text.splitlines():
+    s = line.strip()
+    if s.startswith("#") or ":" not in s:
+        continue
+    m = re.match(r"(port|secret-key)\s*:\s*(.*)", s)
+    if not m:
+        continue
+    k, v = m.group(1), m.group(2).strip()
+    if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+        v = v[1:-1]
+    if k == "port":
+        digits = re.sub(r"\D", "", v)
+        if digits:
+            port = digits
+    elif k == "secret-key":
+        if v == "":
+            key_status = "为空（管理界面会被禁用 → 需设置后重启服务）"
+        elif v.startswith(("$2a$", "$2b$", "$2y$")):
+            key_status = "已设置（bcrypt 哈希，原明文无法找回）"
+        else:
+            key_status = "已设置（明文）"
+print(port or "8317")
+print(key_status)
+PY
+}
+
+print_info() {
+  local bin="$1" config="$2"
+  local pk port key_status
+  pk="$(read_port_key "$config")"
+  port="$(printf '%s\n' "$pk" | head -1)"
+  key_status="$(printf '%s\n' "$pk" | tail -1)"
+  echo ""
+  echo "  ── CLIProxyAPI 关键信息 ──"
+  echo "  二进制       : $bin"
+  echo "  配置文件     : $config"
+  echo "  WebUI 入口   : http://localhost:$port/management.html"
+  echo "  管理密码字段 : remote-management.secret-key"
+  echo "                （在配置文件的 remote-management: 段下；这是 WebUI 登录密码，"
+  echo "                  与 api-keys 里的 sk-* 是两回事）"
+  echo "  密码当前状态 : $key_status"
+  echo "  日志文件     : $LOG"
+  echo ""
+}
+
+is_running() {
+  [ -f "$PIDFILE" ] || return 1
+  local pid
+  pid="$(cat "$PIDFILE" 2>/dev/null)"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+cmd_on() {
+  local bin config
+  bin="$(detect_bin)" || { echo "✗ 未找到 cli-proxy-api，请先安装：brew install cliproxyapi" >&2; exit 1; }
+  config="$(detect_config)" || { echo "✗ 未找到配置文件（默认 ~/.cli-proxy-api/config.yaml）" >&2; exit 1; }
+
+  if is_running; then
+    echo "✔ cli-proxy-api 已在运行 (PID $(cat "$PIDFILE"))"
+    print_info "$bin" "$config"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$LOG")"
+  nohup "$bin" -config "$config" >>"$LOG" 2>&1 &
+  local pid=$!
+  echo "$pid" > "$PIDFILE"
+  sleep 1.5
+
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "✔ cli-proxy-api 已启动 (PID $pid)"
+  else
+    echo "✗ 启动失败，日志见: $LOG" >&2
+    tail -5 "$LOG" 2>/dev/null >&2
+    rm -f "$PIDFILE"
+    exit 1
+  fi
+  print_info "$bin" "$config"
+}
+
+cmd_off() {
+  local pid
+  if [ -f "$PIDFILE" ]; then
+    pid="$(cat "$PIDFILE" 2>/dev/null)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid"
+      local i=0
+      while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 20 ]; do sleep 0.3; i=$((i+1)); done
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "✗ 进程未响应，强制结束…" >&2
+        kill -9 "$pid" 2>/dev/null
+      fi
+    fi
+    rm -f "$PIDFILE"
+  fi
+  # 兜底：清理按名字匹配的残留进程（大小写不匹配，不会误杀本脚本）
+  pkill -f 'cli-proxy-api' 2>/dev/null
+  pkill -f 'cliproxyapi' 2>/dev/null
+  echo "✔ cli-proxy-api 已停止"
+}
+
+cmd_status() {
+  local bin config
+  if is_running; then
+    echo "✔ cli-proxy-api 运行中 (PID $(cat "$PIDFILE"))"
+  else
+    echo "✗ cli-proxy-api 未运行"
+  fi
+  bin="$(detect_bin 2>/dev/null)"
+  config="$(detect_config 2>/dev/null)"
+  if [ -n "$bin" ] && [ -n "$config" ]; then
+    print_info "$bin" "$config"
+  fi
+}
+
+cmd_info() {
+  local bin config
+  bin="$(detect_bin)" || bin="(未找到，请先 brew install cliproxyapi)"
+  config="$(detect_config)" || config="(未找到)"
+  if [ -f "$config" ]; then
+    print_info "$bin" "$config"
+  else
+    echo "  二进制   : $bin"
+    echo "  配置文件 : $config"
+  fi
+}
+
+cmd_log() {
+  if [ ! -f "$LOG" ]; then
+    echo "日志文件不存在: $LOG" >&2
+    exit 1
+  fi
+  tail -n 100 -F "$LOG"
+}
+
+usage() {
+  cat <<EOF
+用法: cpa <命令>
+
+命令:
+  on        启动 cli-proxy-api（后台运行）并打印关键信息
+  off       停止 cli-proxy-api
+  status    查看运行状态
+  info      只打印关键信息，不启停
+  log       实时查看日志（Ctrl+C 退出）
+  help      显示本帮助
+
+环境变量: CPA_BIN / CPA_CONFIG / CPA_LOG / CPA_PIDFILE
+EOF
+}
+
+case "${1:-}" in
+  on)         cmd_on ;;
+  off)        cmd_off ;;
+  status|st)  cmd_status ;;
+  info)       cmd_info ;;
+  log)        cmd_log ;;
+  help|-h|--help|"") usage ;;
+  *)          echo "未知命令: $1" >&2; usage >&2; exit 1 ;;
+esac
