@@ -25,6 +25,22 @@
 
 set -u
 
+# 解析脚本自身所在目录（跟随软链），用于在 cpa 同目录探测二进制与 config
+__cpa_resolve_self() {
+  local src="${BASH_SOURCE[0]:-$0}"
+  case "$src" in
+    */*) : ;;
+    *) src="$(command -v "$src" 2>/dev/null)" || src="$0" ;;
+  esac
+  while [ -L "$src" ]; do
+    local d; d="$(cd -P "$(dirname "$src")" 2>/dev/null && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in /*) : ;; *) src="$d/$src" ;; esac
+  done
+  cd -P "$(dirname "$src")" 2>/dev/null && pwd
+}
+SELF_DIR="$(__cpa_resolve_self)"
+
 LOG="${CPA_LOG:-$HOME/Library/Logs/cliproxyapi.log}"
 PIDFILE="${CPA_PIDFILE:-${TMPDIR:-/tmp}/cpa.pid}"
 
@@ -34,16 +50,20 @@ detect_bin() {
     printf '%s\n' "$CPA_BIN"; return 0
   fi
   local c p
+  # 优先：脚本同目录（cpa 通常与二进制一起安装）
+  for p in "$SELF_DIR/cli-proxy-api" "$SELF_DIR/cliproxyapi"; do
+    if [ -f "$p" ] && [ -x "$p" ]; then printf '%s\n' "$p"; return 0; fi
+  done
+  # PATH 查找（-f 排除同名目录被误判为可执行）
   for c in cli-proxy-api cliproxyapi; do
     p="$(command -v "$c" 2>/dev/null)"
-    if [ -n "$p" ]; then printf '%s\n' "$p"; return 0; fi
+    if [ -n "$p" ] && [ -f "$p" ]; then printf '%s\n' "$p"; return 0; fi
   done
-  local p
   for p in /opt/homebrew/opt/cliproxyapi/bin/cliproxyapi \
            /usr/local/opt/cliproxyapi/bin/cliproxyapi \
            /opt/homebrew/bin/cliproxyapi \
            /usr/local/bin/cliproxyapi; do
-    if [ -x "$p" ]; then printf '%s\n' "$p"; return 0; fi
+    if [ -f "$p" ] && [ -x "$p" ]; then printf '%s\n' "$p"; return 0; fi
   done
   return 1
 }
@@ -53,7 +73,11 @@ detect_config() {
     printf '%s\n' "$CPA_CONFIG"; return 0
   fi
   local p bdir
-  # 优先：二进制同目录下的 config.yaml（standalone 安装最常见）
+  # 优先：脚本同目录下的 config.yaml
+  if [ -f "$SELF_DIR/config.yaml" ]; then
+    printf '%s\n' "$SELF_DIR/config.yaml"; return 0
+  fi
+  # 二进制同目录下的 config.yaml（standalone 安装最常见）
   bdir="$(dirname "$(detect_bin 2>/dev/null)" 2>/dev/null)"
   if [ -n "$bdir" ] && [ -f "$bdir/config.yaml" ]; then
     printf '%s\n' "$bdir/config.yaml"; return 0
