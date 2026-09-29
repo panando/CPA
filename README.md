@@ -123,17 +123,23 @@ cpa status
 
 ## 配置文件说明
 
-`config.yaml` 关键字段：
+`config.yaml` 关键字段（v8 布局，`config-version: 8`）：
 
 | 字段 | 说明 |
 |------|------|
-| `host` / `port` | 监听地址与端口（默认 `127.0.0.1:8317`） |
-| `api-keys` | 下游客户端访问 CPA 的本地访问令牌 |
-| `remote-management.secret-key` | WebUI 管理密码（首次启动自动哈希） |
-| `auth-dir` | OAuth/凭证目录 |
+| `server.host` / `server.port` | 监听地址与端口（默认 `""` + `8317`；设为 `127.0.0.1` 则仅本机可访问） |
+| `access.api-keys` | 下游客户端访问 CPA 的本地访问令牌 |
+| `management.secret-key` | WebUI 管理密码（首次启动自动哈希） |
+| `oauth.auth-dir` | OAuth/凭证目录 |
 | `routing.strategy` | 负载均衡策略：`round-robin` / `weighted-round-robin` / `fill-first` |
 | `routing.session-affinity` | 同一会话绑定同一 key |
-| `providers` | 上游 Provider（`claude-api-key`、`openai-compatibility` 等），API Key 可用 `${VAR}` 占位符 |
+| `api-keys.<provider>` | 上游 Provider 分组（`claude`、`openai-compatibility`、`codex` 等），API Key 可用 `${VAR}` 占位符 |
+
+每个 Provider 是一个分组：`name` / `base-url` / `models` 挂在分组上，密钥放在分组的 `keys` 列表里。
+
+> 旧版布局（`host`、`api-keys`、`claude-api-key`、`remote-management` 等）CPA 仍可读取，
+> 但官方文档说明 `/v8/management` 的配置写入会拒绝旧字段名，建议尽早迁移。字段对照表见
+> <https://help.router-for.me/cn/configuration/options>。
 
 Provider 模型可配置 `max-context-length`，避免下游客户端一律显示 200k。
 

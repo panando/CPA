@@ -151,7 +151,9 @@ PY
   printf '%s\n' "$tmpfile"
 }
 
-# 读取端口 + 管理密码状态（只输出非敏感信息，绝不输出密码值）
+# 读取端口 + 管理密码状态 + 字段路径（只输出非敏感信息，绝不输出密码值）
+# 字段路径随配置布局变化：v8 为 management.secret-key / access.api-keys，
+# 旧版布局为 remote-management.secret-key / api-keys，这里按实际读到的段落名推断。
 read_port_key() {
   python3 - "$1" <<'PY'
 import sys, re
@@ -161,11 +163,23 @@ except Exception:
     text = ""
 port = None
 key_status = "未配置（配置文件中没有该字段）"
+key_field = "management.secret-key"
+access_field = "access.api-keys"
+saw_access_keys = False
+saw_root_keys = False
+section = ""
 for line in text.splitlines():
     s = line.strip()
-    if s.startswith("#") or ":" not in s:
+    if not s or s.startswith("#") or ":" not in s:
         continue
-    m = re.match(r"(port|secret-key)\s*:\s*(.*)", s)
+    if len(line) - len(line.lstrip()) == 0:
+        # 顶层键：记录当前段落，供下层字段推断完整路径
+        section = s.split(":", 1)[0].strip()
+        if section == "api-keys":
+            # v8 布局下根级 api-keys 是上游 provider 映射，语义与旧版的客户端密钥列表不同
+            saw_root_keys = True
+        continue
+    m = re.match(r"(port|secret-key|api-keys)\s*:\s*(.*)", s)
     if not m:
         continue
     k, v = m.group(1), m.group(2).strip()
@@ -176,31 +190,41 @@ for line in text.splitlines():
         if digits:
             port = digits
     elif k == "secret-key":
+        key_field = f"{section}.secret-key" if section else "secret-key"
         if v == "":
             key_status = "为空（管理界面会被禁用 → 需设置后重启服务）"
         elif v.startswith(("$2a$", "$2b$", "$2y$")):
             key_status = "已设置（bcrypt 哈希，原明文无法找回）"
         else:
             key_status = "已设置（明文或环境变量引用）"
+    elif k == "api-keys" and section == "access":
+        saw_access_keys = True
+# access.api-keys 是 v8 的正确位置；仅在没找到它时才回退到旧版根级 api-keys
+if not saw_access_keys and saw_root_keys:
+    access_field = "api-keys"
 print(port or "8317")
 print(key_status)
+print(key_field)
+print(access_field)
 PY
 }
 
 print_info() {
   local bin="$1" config="$2"
-  local pk port key_status
+  local pk port key_status key_field access_field
   pk="$(read_port_key "$config")"
-  port="$(printf '%s\n' "$pk" | head -1)"
-  key_status="$(printf '%s\n' "$pk" | tail -1)"
+  port="$(printf '%s\n' "$pk" | sed -n 1p)"
+  key_status="$(printf '%s\n' "$pk" | sed -n 2p)"
+  key_field="$(printf '%s\n' "$pk" | sed -n 3p)"
+  access_field="$(printf '%s\n' "$pk" | sed -n 4p)"
   echo ""
   echo "  ── CLIProxyAPI 关键信息 ──"
   echo "  二进制       : $bin"
   echo "  配置文件     : $config"
   echo "  WebUI 入口   : http://localhost:$port/management.html"
-  echo "  管理密码字段 : remote-management.secret-key"
-  echo "                （在配置文件的 remote-management: 段下；这是 WebUI 登录密码，"
-  echo "                  与 api-keys 里的 sk-* 是两回事）"
+  echo "  管理密码字段 : $key_field"
+  echo "                （在配置文件的 ${key_field%%.*}: 段下；这是 WebUI 登录密码，"
+  echo "                  与 $access_field 里的客户端密钥是两回事）"
   echo "  密码当前状态 : $key_status"
   echo "  日志文件     : $LOG"
   echo ""
